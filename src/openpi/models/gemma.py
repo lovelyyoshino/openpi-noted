@@ -38,25 +38,25 @@ import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
+# 定义词汇量大小常量
 PALIGEMMA_VOCAB_SIZE = 257_152
 
-
+# 使用数据类定义配置参数
 @dataclasses.dataclass
 class Config:
-    width: int
-    depth: int
-    mlp_dim: int
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-    lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+    width: int  # 模型宽度
+    depth: int  # 模型深度
+    mlp_dim: int  # MLP层维度
+    num_heads: int  # 注意力头数
+    num_kv_heads: int  # 键值对头数
+    head_dim: int  # 每个头的维度
+    lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)  # LoRA 配置字典
 
-
+# 定义可用的模型变体类型
 Variant = Literal["dummy", "gemma_300m", "gemma_2b", "gemma_2b_lora"]
 
-
 def get_config(variant: Variant) -> Config:
-    """Returns config for specified gemma variant."""
+    """根据指定的 gemma 变体返回相应的配置。"""
     if variant == "dummy":
         return Config(
             width=64,
@@ -67,7 +67,7 @@ def get_config(variant: Variant) -> Config:
             head_dim=16,
         )
     if variant == "gemma_300m":
-        # 311M params
+        # 311M 参数
         return Config(
             width=1024,
             depth=18,
@@ -96,7 +96,7 @@ def get_config(variant: Variant) -> Config:
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
     if variant == "gemma_300m_lora":
-        # 311M params
+        # 311M 参数
         return Config(
             width=1024,
             depth=18,
@@ -106,31 +106,30 @@ def get_config(variant: Variant) -> Config:
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
         )
-    raise ValueError(f"Unknown variant: {variant}")
+    raise ValueError(f"Unknown variant: {variant}")  # 抛出未识别变体的异常
 
 
 @at.typecheck
 class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
-        dtype = x.dtype  # original dtype, could be half-precision
-        scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
-        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
-        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
-        normed_inputs = normed_inputs * (
-            1 + scale
-        )  # scale by learned parameter in float32 (matches Flax implementation)
-        return normed_inputs.astype(dtype)  # return in original dtype
+        dtype = x.dtype  # 获取原始数据类型，可能为半精度
+        scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))  # 初始化缩放参数
+        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # 计算方差，使用float32
+        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # 标准化输入
+        normed_inputs = normed_inputs * (1 + scale)  # 根据学习到的参数进行缩放
+        return normed_inputs.astype(dtype)  # 返回与原始数据类型一致的数据
 
 
 @at.typecheck
 class Embedder(nn.Module):
-    """Embedder module."""
+    """嵌入模块。"""
 
-    vocab_size: int
-    embed_dim: int
+    vocab_size: int  # 词汇表大小
+    embed_dim: int  # 嵌入维度
 
     def setup(self):
+        # 设置输入嵌入表的参数
         self.input_embedding_table = self.param(
             "input_embedding",
             nn.initializers.normal(),
@@ -138,89 +137,99 @@ class Embedder(nn.Module):
         )
 
     def encode(self, x):
+        # 编码输入，通过查找嵌入表获得嵌入向量
         x = self.input_embedding_table[(x,)]
-        x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
+        x *= jnp.sqrt(self.embed_dim).astype(x.dtype)  # 对嵌入结果进行缩放
         return x
 
     def decode(self, x):
+        # 解码嵌入向量，通过矩阵乘法重建输入
         return jnp.dot(x, self.input_embedding_table.T)
 
 
 @at.typecheck
 class Attention(nn.Module):
-    """Attention module."""
+    """注意力模块。"""
 
-    configs: Sequence[Config]
+    configs: Sequence[Config]  # 注意力头配置序列
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
-        # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
+        # 所有专家必须共享相同的头维度、头数及键值对头数，以使自注意力工作
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
-        dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
+        dtype = next(x.dtype for x in xs if x is not None)  # 确定输入中的数据类型
+        
+        qkvs = []  # 存储查询（Q）、键（K）和值（V）
 
-        qkvs = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
                 continue
+            
+            # 判断是否kv头数等于head数
             if config.num_kv_heads == config.num_heads:
+                # 使用爱因斯坦求和记号创建QKV张量
                 qkv_einsum = lora.Einsum(
                     shape=(3, config.num_heads, config.width, config.head_dim),
                     name=_name("qkv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
+                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))  # 计算QKV张量
             else:
+                # 单独对Q和KV做处理
                 q_einsum = lora.Einsum(
                     shape=(config.num_heads, config.width, config.head_dim),
                     name=_name("q_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                q = q_einsum("BTD,NDH->BTNH", x)
+                q = q_einsum("BTD,NDH->BTNH", x)  # 计算查询Q
                 kv_einsum = lora.Einsum(
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                k, v = kv_einsum("BSD,2KDH->2BSKH", x)
+                k, v = kv_einsum("BSD,2KDH->2BSKH", x)  # 计算键K和值V
                 qkvs.append((q, k, v))
 
+        # 将所有的Q、K、V按批次连接起来
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
-        q = _apply_rope(q, positions=positions)
-        q *= self.configs[0].head_dim ** -0.5
+        # 应用位置编码
+        q = _apply_rope(q, positions=positions)  
+        q *= self.configs[0].head_dim ** -0.5  # 缩放Q
 
-        k = _apply_rope(k, positions=positions)
+        k = _apply_rope(k, positions=positions)  # 同样处理K
 
-        # should still be half-precision here (if input was half-precision)
+        # 检查数据类型
         assert q.dtype == k.dtype == v.dtype == dtype
 
         if kv_cache is not None:
-            cache_k, cache_v = kv_cache
-            k = jnp.concatenate([cache_k, k], axis=1)
-            v = jnp.concatenate([cache_v, v], axis=1)
+            cache_k, cache_v = kv_cache  # 从缓存中获取K和V
+            k = jnp.concatenate([cache_k, k], axis=1)  # 合并新旧K
+            v = jnp.concatenate([cache_v, v], axis=1)  # 合并新旧V
 
+        # 重塑Q以适配后续运算
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
-        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+        logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)  # 计算logits
 
+        # 验证注意力掩码形状
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
-        # big_neg = jnp.finfo(logits.dtype).min
-        big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+        big_neg = -2.3819763e38  # a large negative value for masking
+        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)  # 应用mask以限制无效区域
 
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)  # 计算softmax得到概率分布
 
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
-        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)  # 利用概率加权求和得编码结果
+        encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")  # 重塑编码输出
 
         out = []
         start = 0
@@ -233,79 +242,80 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))  # 生成最终输出
                 start = end
             else:
                 out.append(None)
 
-        return out, (k, v)
-
+        return out, (k, v)  # 返回输出结果及更新的k/v缓存
 
 @at.typecheck
 class FeedForward(nn.Module):
-    """Feed forward module."""
+    """前馈模块。"""
 
-    features: int
-    hidden_dim: int
+    features: int  # 输入特征维度
+    hidden_dim: int  # 隐藏层维度
 
     @nn.compact
     def __call__(self, x):
-        dtype = x.dtype  # original dtype, could be half-precision
+        dtype = x.dtype  # 原始数据类型，可以是半精度
         w_gating = self.param(
             "gating_einsum",
             nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
             (2, self.features, self.hidden_dim),
-        ).astype(dtype)
-        ff_gate = jnp.dot(x, w_gating[0])
-        gate_value = nn.gelu(ff_gate)
+        ).astype(dtype)  # 初始化门控权重
+        
+        ff_gate = jnp.dot(x, w_gating[0])  # 计算门控值
+        gate_value = nn.gelu(ff_gate)  # 应用GELU激活函数
 
-        ff1 = jnp.dot(x, w_gating[1])
-        activations = gate_value * ff1
+        ff1 = jnp.dot(x, w_gating[1])  # 计算前馈网络的输出
+        activations = gate_value * ff1  # 使用门控值加权前馈输出
 
         w_linear = self.param(
             "linear",
             nn.initializers.lecun_normal(in_axis=-2, out_axis=-1),
             (self.hidden_dim, self.features),
-        ).astype(dtype)
-        outputs = jnp.dot(activations, w_linear)
-        assert outputs.dtype == dtype
+        ).astype(dtype)  # 初始化线性变换权重
+        
+        outputs = jnp.dot(activations, w_linear)  # 计算最终输出
+        assert outputs.dtype == dtype  # 确保输出的数据类型与输入一致
         return outputs
 
 
 @at.typecheck
 class Block(nn.Module):
-    """Transformer block."""
+    """Transformer块。"""
 
-    configs: Sequence[Config]
+    configs: Sequence[Config]  # 配置序列
 
-    dropout: float = 0.0
-    dropout_bdims: tuple[int, ...] = ()
+    dropout: float = 0.0  # Dropout比率
+    dropout_bdims: tuple[int, ...] = ()  # 每个浮点数独立丢弃的维度
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
-        xs = sharding.activation_sharding_constraint(xs)
-        drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
+        xs = sharding.activation_sharding_constraint(xs)  # 限制激活的分片
+        drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x  # 定义Dropout操作
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, name="attn")  # 创建注意力机制实例
 
-        pre_attn = []
+        pre_attn = []  # 存储预处理后的输入
         for i, x in enumerate(xs):
             if x is not None:
-                x = RMSNorm(name=_name("pre_attention_norm", i))(x)  # noqa: PLW2901
+                x = RMSNorm(name=_name("pre_attention_norm", i))(x)  # 对输入进行归一化
             pre_attn.append(x)
 
-        pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
-        post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
-        post_attn = sharding.activation_sharding_constraint(post_attn)
-        xs = jax.tree.map(lambda x, y: x + y, xs, post_attn)
-        xs = sharding.activation_sharding_constraint(xs)
+        pre_attn = sharding.activation_sharding_constraint(pre_attn)  # 限制预处理激活的分片
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)  # 执行注意力机制
+        post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)  # 应用Dropout
+        post_attn = sharding.activation_sharding_constraint(post_attn)  # 限制后处理激活的分片
+        xs = jax.tree.map(lambda x, y: x + y, xs, post_attn)  # 残差连接
+        xs = sharding.activation_sharding_constraint(xs)  # 再次限制激活的分片
 
-        out = []
+        out = []  # 存储输出结果
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
-                x = RMSNorm(name=_name("pre_ffw_norm", i))(x)  # noqa: PLW2901
-                x = lora.FeedForward(  # noqa: PLW2901
+                x = RMSNorm(name=_name("pre_ffw_norm", i))(x)  # 对输入进行归一化
+                x = lora.FeedForward(  # 调用前馈网络
                     features=config.width,
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
@@ -313,13 +323,13 @@ class Block(nn.Module):
                 )(x)
             out.append(x)
 
-        out = sharding.activation_sharding_constraint(out)
+        out = sharding.activation_sharding_constraint(out)  # 限制输出激活的分片
 
-        out = jax.tree.map(lambda x: drop(x, deterministic), out)
-        xs = jax.tree.map(lambda x, y: x + y, xs, out)
-        xs = sharding.activation_sharding_constraint(xs)
+        out = jax.tree.map(lambda x: drop(x, deterministic), out)  # 应用Dropout
+        xs = jax.tree.map(lambda x, y: x + y, xs, out)  # 残差连接
+        xs = sharding.activation_sharding_constraint(xs)  # 最终限制激活的分片
 
-        return xs, kv_cache
+        return xs, kv_cache  # 返回更新后的输入和kv缓存
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -327,21 +337,21 @@ KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array
 
 @at.typecheck
 class Module(nn.Module):
-    """Transformer model, supporting a mixture of different weights for different tokens."""
+    """Transformer模型，支持不同token的不同权重混合。"""
 
-    configs: Sequence[Config]  # list of configs, one for each expert
-    embed_dtype: str
+    configs: Sequence[Config]  # 每个专家的配置列表
+    embed_dtype: str  # 嵌入数据类型
 
-    dropout: float = 0.0
-    dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
+    dropout: float = 0.0  # Dropout比率
+    dropout_bdims: tuple[int, ...] = ()  # 每个浮点数独立丢弃的维度
 
     def setup(self):
-        # all experts must have the same depth
+        # 所有专家必须具有相同的深度
         assert all(config.depth == self.configs[0].depth for config in self.configs)
 
         self.embedder = Embedder(
             vocab_size=PALIGEMMA_VOCAB_SIZE,
-            embed_dim=self.configs[0].width,  # embedder for first expert only
+            embed_dim=self.configs[0].width,  # 仅为第一个专家创建嵌入器
             name="embedder",
         )
         block_cls = nn.remat(
@@ -365,62 +375,56 @@ class Module(nn.Module):
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
-        return self.embedder.encode(tokens).astype(self.embed_dtype)
+        return self.embedder.encode(tokens).astype(self.embed_dtype)  # 将tokens编码为嵌入向量并转换为指定数据类型
 
     @at.typecheck
     def __call__(
         self,
-        # list of token arrays, one for each expert, or None if that expert should not be run
-        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
-        positions: at.Int[at.Array, "b t"],
-        mask: at.Bool[at.Array, "b t s"],
+        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],  # 每个专家的token数组或None（如果该专家不运行）
+        positions: at.Int[at.Array, "b t"],  # token的位置
+        mask: at.Bool[at.Array, "b t s"],  # 注意力掩码
         *,
-        kv_cache: KVCache | None = None,
-        deterministic: bool = True,
+        kv_cache: KVCache | None = None,  # 键值缓存
+        deterministic: bool = True,  # 是否确定性推理
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
-        embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
-        mask = jnp.asarray(mask)[:, None, :, :]
+        embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)  # 转换嵌入数据类型
+        mask = jnp.asarray(mask)[:, None, :, :]  # 扩展掩码维度
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, deterministic)
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, deterministic)  # 通过层传递嵌入
 
-        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
+        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)  # 确保所有嵌入的dtype一致
 
-        return [f(e) if e is not None else e for f, e in zip(self.final_norms, embedded, strict=True)], kv_cache
+        return [f(e) if e is not None else e for f, e in zip(self.final_norms, embedded, strict=True)], kv_cache  # 返回经过最终归一化的嵌入和kv缓存
 
     def init(self):
-        """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
-        self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        """初始化所有参数的便利方法，由于linen的特殊性而必要。"""
+        self.embed(jnp.zeros((1, 1), dtype=jnp.int32))  # 初始化嵌入
         self(
-            [jnp.zeros((1, 1, c.width)) for c in self.configs],
-            jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
-            jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
+            [jnp.zeros((1, 1, c.width)) for c in self.configs],  # 为每个专家初始化零张量
+            jnp.zeros((1, len(self.configs)), dtype=jnp.int32),  # 初始化位置张量
+            jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),  # 初始化掩码张量
         )
 
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):
-    """Applies RoPE positions [B, L] to x [B, L, H, D]."""
-    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
-    timescale = max_wavelength**freq_exponents
-    radians = positions[..., None] / timescale[None, None, :]
+    """将RoPE位置应用于x [B, L]到x [B, L, H, D]。"""
+    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)  # 频率指数
+    timescale = max_wavelength**freq_exponents  # 时间尺度
+    radians = positions[..., None] / timescale[None, None, :]  # 将位置映射到弧度
     radians = radians[..., None, :]
     assert radians.dtype == jnp.float32
     # radians.shape = [...,L,1,d=D/2]
-    sin, cos = jnp.sin(radians), jnp.cos(radians)
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+    sin, cos = jnp.sin(radians), jnp.cos(radians)  # 计算正弦和余弦
+    x1, x2 = jnp.split(x, 2, axis=-1)  # 将x拆分为两部分
+    res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)  # 应用RoPE公式
     assert res.dtype == jnp.float32
-    # The original bigvision impl allows RoPE to upcast to float32. It is then immediately downcast again to the cache
-    # dtype when in inference mode (but not in training mode). I don't think any of this was intentional. Based on the
-    # original DeepMind impl, as well as the widely-used transformers impl, it is ok to always downcast back to bfloat16
-    # here.
-    return res.astype(x.dtype)
+    # 根据原始bigvision实现，允许RoPE上升到float32，然后在推理模式下立即降级回缓存dtype
+    return res.astype(x.dtype)  # 返回与输入相同数据类型的结果
 
 
 def _name(name, i):
-    # we name layers like this because we want the first expert's weights to have no suffix (e.g., "attn"), so that they
-    # can be loaded seamlessly from the existing PaliGemma checkpoint. subsequent experts will have a suffix (e.g.,
-    # "attn_1") and their weights will be initialized from scratch. in practice, we only use two experts -- PaliGemma,
-    # and the action expert.
+    # 我们以这种方式命名层，因为我们希望第一个专家的权重没有后缀（例如，“attn”），这样它们可以无缝加载现有的PaliGemma检查点。
+    # 后续专家将有后缀（例如，“attn_1”），其权重将从头开始初始化。在实践中，我们只使用两个专家 -- PaliGemma和动作专家。
     if i == 0:
         return name
     return f"{name}_{i}"

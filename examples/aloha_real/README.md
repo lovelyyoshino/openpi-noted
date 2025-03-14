@@ -1,5 +1,10 @@
 # Run Aloha (Real Robot)
 
+流程顺序为：constants.py-->real_env.py-->env.py(实例化算法里面的一些环境信息)--> main.py(数据采集) ---> convert_aloha_data_to_lerobot.py(数据转化)
+                        robot_util.py--->
+                        
+
+
 This example demonstrates how to run with a real robot using an [ALOHA setup](https://github.com/tonyzhaozh/aloha). See [here](../../docs/remote_inference.md) for instructions on how to load checkpoints and run inference. We list the relevant checkpoint paths for each provided fine-tuned model below.
 
 ## Prerequisites
